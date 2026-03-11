@@ -1,26 +1,27 @@
 // portpilot — automatic port detection and reverse proxy.
 //
 // Monitors /proc/net/tcp for new listening ports and dynamically proxies
-// them at /proxy/{port}/. Designed to run inside containers alongside
-// a primary process (like ttyd, code-server, or any dev server).
+// them at /proxy/{port}/. Designed to run inside containers as the
+// external-facing port, routing to internal services.
 //
 // Usage:
 //
-//	portpilot [flags] -- command [args...]
-//	portpilot --listen :7681 --base-path /ws/abc123 -- ttyd --port 7682 --writable bash
+//	portpilot --listen :7681 --default 7682
 //
 // Flags:
 //
-//	--listen       Address to listen on (default ":8080")
-//	--base-path    Base URL path prefix (default "", read from $PROXY_BASE_PATH)
+//	--listen        Address to listen on (default ":7681")
+//	--default       Port to proxy at / (e.g. ttyd on 7682)
+//	--base-path     Base URL path prefix (default "", read from $PROXY_BASE_PATH)
 //	--scan-interval Interval between port scans (default "2s")
-//	--ignore       Comma-separated ports to ignore (default: the listen port)
+//	--ignore        Comma-separated ports to ignore (default: the listen port)
 package main
 
 import (
 	"bufio"
 	"context"
 	"encoding/hex"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
@@ -29,7 +30,6 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"os"
-	"os/exec"
 	"os/signal"
 	"strconv"
 	"strings"
@@ -42,19 +42,18 @@ var version = "dev"
 
 func main() {
 	listen := flag.String("listen", ":7681", "Address to listen on")
+	defaultPort := flag.Int("default", 0, "Port to proxy at / (e.g. 7682 for ttyd)")
 	basePath := flag.String("base-path", os.Getenv("PROXY_BASE_PATH"), "Base URL path prefix")
 	scanInterval := flag.Duration("scan-interval", 2*time.Second, "Port scan interval")
 	ignore := flag.String("ignore", "", "Comma-separated ports to ignore")
 	showVersion := flag.Bool("version", false, "Print version and exit")
 
-	// Parse flags up to "--"
 	flag.Parse()
 
 	if *showVersion {
 		fmt.Println("portpilot", version)
 		os.Exit(0)
 	}
-	cmdArgs := flag.Args()
 
 	// Determine the listen port to auto-ignore.
 	_, listenPortStr, _ := net.SplitHostPort(*listen)
@@ -72,19 +71,23 @@ func main() {
 	// Normalize base path.
 	bp := strings.TrimRight(*basePath, "/")
 
-	pp := &PortPilot{
-		basePath:    bp,
-		ignorePorts: ignorePorts,
-		proxies:     make(map[int]*httputil.ReverseProxy),
+	// Set up default port proxy if specified.
+	var defaultProxy *httputil.ReverseProxy
+	if *defaultPort > 0 {
+		target, _ := url.Parse(fmt.Sprintf("http://127.0.0.1:%d", *defaultPort))
+		defaultProxy = httputil.NewSingleHostReverseProxy(target)
+		ignorePorts[*defaultPort] = true
 	}
 
-	// Start the child process if specified.
+	pp := &PortPilot{
+		basePath:     bp,
+		ignorePorts:  ignorePorts,
+		proxies:      make(map[int]*httputil.ReverseProxy),
+		defaultProxy: defaultProxy,
+	}
+
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
-
-	if len(cmdArgs) > 0 {
-		go pp.runChild(ctx, cmdArgs)
-	}
 
 	// Start port scanner.
 	go pp.scanLoop(ctx, *scanInterval)
@@ -107,8 +110,9 @@ func main() {
 
 // PortPilot manages port detection and proxying.
 type PortPilot struct {
-	basePath    string
-	ignorePorts map[int]bool
+	basePath     string
+	ignorePorts  map[int]bool
+	defaultProxy *httputil.ReverseProxy
 
 	mu      sync.RWMutex
 	proxies map[int]*httputil.ReverseProxy
@@ -124,6 +128,19 @@ func (pp *PortPilot) handler(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		reqPath = strings.TrimPrefix(reqPath, pp.basePath)
+	}
+
+	// GET /ports — return detected ports as JSON.
+	if reqPath == "/ports" {
+		pp.mu.RLock()
+		ports := make([]int, 0, len(pp.proxies))
+		for p := range pp.proxies {
+			ports = append(ports, p)
+		}
+		pp.mu.RUnlock()
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{"ports": ports})
+		return
 	}
 
 	// Check for /proxy/{port}/... pattern.
@@ -152,7 +169,14 @@ func (pp *PortPilot) handler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Not a proxy request — return info page.
+	// Not a /proxy/ request — forward to default port if configured.
+	if pp.defaultProxy != nil {
+		r.URL.Path = reqPath
+		pp.defaultProxy.ServeHTTP(w, r)
+		return
+	}
+
+	// No default port — return info page.
 	pp.mu.RLock()
 	ports := make([]int, 0, len(pp.proxies))
 	for p := range pp.proxies {
@@ -295,23 +319,4 @@ func scanListeningPorts() ([]int, error) {
 	}
 
 	return ports, nil
-}
-
-// runChild starts and monitors the child process.
-func (pp *PortPilot) runChild(ctx context.Context, args []string) {
-	cmd := exec.CommandContext(ctx, args[0], args[1:]...)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	cmd.Stdin = os.Stdin
-
-	log.Printf("portpilot: starting child: %s", strings.Join(args, " "))
-	if err := cmd.Run(); err != nil {
-		if ctx.Err() != nil {
-			return // normal shutdown
-		}
-		log.Fatalf("portpilot: child exited: %v", err)
-	}
-	// Child exited cleanly — shut down portpilot too.
-	log.Println("portpilot: child exited, shutting down")
-	os.Exit(0)
 }
