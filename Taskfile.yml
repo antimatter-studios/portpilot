@@ -1,0 +1,45 @@
+version: '3'
+
+vars:
+  BINARY_NAME: portpilot
+
+tasks:
+  default:
+    cmds:
+      - task --list
+
+  build:
+    desc: Build portpilot for the current platform
+    cmds:
+      - CGO_ENABLED=0 go build -ldflags="-s -w" -o {{.BINARY_NAME}} .
+
+  build:linux:amd64:
+    desc: Cross-compile for linux/amd64
+    cmds:
+      - GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -ldflags="-s -w" -o {{.BINARY_NAME}}-linux-amd64 .
+
+  build:linux:arm64:
+    desc: Cross-compile for linux/arm64
+    cmds:
+      - GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -ldflags="-s -w" -o {{.BINARY_NAME}}-linux-arm64 .
+
+  build:all:
+    desc: Build for all platforms
+    cmds:
+      - task: build:linux:amd64
+      - task: build:linux:arm64
+
+  docker:
+    desc: Build Docker image
+    cmds:
+      - docker build -t {{.BINARY_NAME}}:latest .
+
+  clean:
+    desc: Clean build artifacts
+    cmds:
+      - rm -f {{.BINARY_NAME}} {{.BINARY_NAME}}-linux-*
+
+  test:
+    desc: Run tests
+    cmds:
+      - go test ./... -v
