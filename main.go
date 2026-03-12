@@ -15,6 +15,8 @@
 //	--base-path     Base URL path prefix (default "", read from $PROXY_BASE_PATH)
 //	--scan-interval Interval between port scans (default "2s")
 //	--ignore        Comma-separated ports to ignore (default: the listen port)
+//	--version       Print version and exit
+//	--ports         Query running instance for detected ports and exit
 package main
 
 import (
@@ -47,11 +49,20 @@ func main() {
 	scanInterval := flag.Duration("scan-interval", 2*time.Second, "Port scan interval")
 	ignore := flag.String("ignore", "", "Comma-separated ports to ignore")
 	showVersion := flag.Bool("version", false, "Print version and exit")
+	showPorts := flag.Bool("ports", false, "Query running instance for detected ports and exit")
 
 	flag.Parse()
 
 	if *showVersion {
 		fmt.Println("portpilot", version)
+		os.Exit(0)
+	}
+
+	// Normalize base path.
+	bp := strings.TrimRight(*basePath, "/")
+
+	if *showPorts {
+		queryPorts(*listen, bp)
 		os.Exit(0)
 	}
 
@@ -68,13 +79,10 @@ func main() {
 		}
 	}
 
-	// Normalize base path.
-	bp := strings.TrimRight(*basePath, "/")
-
 	// Set up default port proxy if specified.
 	var defaultProxy *httputil.ReverseProxy
 	if *defaultPort > 0 {
-		target, _ := url.Parse(fmt.Sprintf("http://127.0.0.1:%d", *defaultPort))
+		target, _ := url.Parse(fmt.Sprintf("http://localhost:%d", *defaultPort))
 		defaultProxy = httputil.NewSingleHostReverseProxy(target)
 		ignorePorts[*defaultPort] = true
 	}
@@ -105,6 +113,38 @@ func main() {
 	log.Printf("portpilot listening on %s (base-path: %s)", *listen, bp)
 	if err := server.ListenAndServe(); err != http.ErrServerClosed {
 		log.Fatalf("server error: %v", err)
+	}
+}
+
+// queryPorts connects to a running portpilot instance and prints detected ports.
+func queryPorts(listen, basePath string) {
+	host, port, err := net.SplitHostPort(listen)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "invalid listen address: %s\n", listen)
+		os.Exit(1)
+	}
+	if host == "" {
+		host = "localhost"
+	}
+	resp, err := http.Get(fmt.Sprintf("http://%s:%s%s/ports", host, port, basePath))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "failed to connect to portpilot at %s: %v\n", listen, err)
+		os.Exit(1)
+	}
+	defer resp.Body.Close()
+	var result struct {
+		Ports []int `json:"ports"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		fmt.Fprintf(os.Stderr, "failed to decode response: %v\n", err)
+		os.Exit(1)
+	}
+	if len(result.Ports) == 0 {
+		fmt.Println("no ports detected")
+		return
+	}
+	for _, p := range result.Ports {
+		fmt.Println(p)
 	}
 }
 
@@ -159,7 +199,7 @@ func (pp *PortPilot) handler(w http.ResponseWriter, r *http.Request) {
 						remainder = "/" + parts[1]
 					}
 					r.URL.Path = remainder
-					r.Header.Set("X-Forwarded-Prefix", pp.basePath+"/proxy/"+parts[0])
+					r.Header.Set("X-Forwarded-Prefix", pp.basePath+"/proxy/"+parts[0]+"/")
 					proxy.ServeHTTP(w, r)
 					return
 				}
@@ -225,7 +265,7 @@ func (pp *PortPilot) scan() {
 			continue
 		}
 		if _, exists := pp.proxies[port]; !exists {
-			target, _ := url.Parse(fmt.Sprintf("http://127.0.0.1:%d", port))
+			target, _ := url.Parse(fmt.Sprintf("http://localhost:%d", port))
 			pp.proxies[port] = httputil.NewSingleHostReverseProxy(target)
 			log.Printf("portpilot: detected port %d → %s/proxy/%d/", port, pp.basePath, port)
 		}
